@@ -18,6 +18,7 @@ from contextlib import asynccontextmanager
 from typing import Any
 
 import joblib
+import pandas as pd
 import numpy as np
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
@@ -40,15 +41,18 @@ class LoanApplication(BaseModel):
         ..., gt=0, description="Requested loan amount in USD"
     )
 
-    model_config = {"json_schema_extra": {
-        "example": {
-            "annual_income": 75000,
-            "credit_score": 720,
-            "debt_to_income_ratio": 0.25,
-            "employment_length_years": 5,
-            "loan_amount_requested": 15000,
-        }
-    }}
+    model_config = {
+        "extra": "allow",
+        "json_schema_extra": {
+            "example": {
+                "annual_income": 75000,
+                "credit_score": 720,
+                "debt_to_income_ratio": 0.25,
+                "employment_length_years": 5,
+                "loan_amount_requested": 15000,
+            }
+        },
+    }
 
 
 class PredictionResponse(BaseModel):
@@ -64,6 +68,8 @@ class PredictionResponse(BaseModel):
 class _ModelStore:
     model: Any = None
     scaler: Any = None
+    feature_columns: list[str] = []
+    positive_label: Any = None
 
 
 store = _ModelStore()
@@ -76,12 +82,21 @@ SCALER_PATH = os.path.join(MODEL_DIR, "scaler.pkl")
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """Load ML artefacts into memory once at startup."""
-    if not os.path.exists(MODEL_PATH) or not os.path.exists(SCALER_PATH):
+    if not os.path.exists(MODEL_PATH):
         raise RuntimeError(
             "Model files not found. Run `python train_model.py` first."
         )
-    store.model = joblib.load(MODEL_PATH)
-    store.scaler = joblib.load(SCALER_PATH)
+    artifacts = joblib.load(MODEL_PATH)
+    if isinstance(artifacts, dict) and "model" in artifacts:
+        store.model = artifacts["model"]
+        store.scaler = artifacts.get("scaler")
+        store.feature_columns = list(artifacts.get("feature_columns", []))
+        store.positive_label = artifacts.get("positive_label")
+    else:
+        store.model = artifacts
+        store.scaler = joblib.load(SCALER_PATH) if os.path.exists(SCALER_PATH) else None
+        store.feature_columns = []
+        store.positive_label = None
     yield
     # Cleanup (none required)
 
@@ -163,21 +178,24 @@ def predict(application: LoanApplication) -> PredictionResponse:
     if store.model is None or store.scaler is None:
         raise HTTPException(status_code=503, detail="Model not loaded.")
 
-    feature_vector = np.array(
-        [
-            [
-                application.annual_income,
-                application.credit_score,
-                application.debt_to_income_ratio,
-                application.employment_length_years,
-                application.loan_amount_requested,
-            ]
-        ],
-        dtype=float,
-    )
+    application_payload = application.model_dump()
+    feature_frame = pd.DataFrame([application_payload])
+    encoded_frame = pd.get_dummies(feature_frame)
 
-    scaled = store.scaler.transform(feature_vector)
-    prob_approved = float(store.model.predict_proba(scaled)[0][1])
+    if store.feature_columns:
+        encoded_frame = encoded_frame.reindex(columns=store.feature_columns, fill_value=0)
+
+    feature_matrix = encoded_frame.to_numpy(dtype=float)
+    scaled = store.scaler.transform(feature_matrix)
+
+    class_probabilities = store.model.predict_proba(scaled)[0]
+    positive_index = 1
+    if store.positive_label is not None and hasattr(store.model, "classes_"):
+        matches = np.where(store.model.classes_ == store.positive_label)[0]
+        if len(matches) == 1:
+            positive_index = int(matches[0])
+
+    prob_approved = float(class_probabilities[positive_index])
     risk_factors = _derive_risk_factors(application)
     decision = _make_decision(prob_approved, risk_factors)
 
