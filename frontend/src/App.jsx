@@ -14,6 +14,7 @@
 import { useState, useEffect } from 'react'
 import LoanForm from './components/LoanForm'
 import ResultCard from './components/ResultCard'
+import ChatWidget from './components/ChatWidget'
 
 const API_BASE = import.meta.env.VITE_API_URL ?? ''
 
@@ -127,6 +128,9 @@ export default function App() {
       <footer className="mt-16 text-xs text-slate-400 dark:text-slate-600 text-center">
         Loan Eligibility Advisor MVP · Powered by RandomForest &amp; FastAPI
       </footer>
+
+      {/* Floating chat widget */}
+      <ChatWidget />
     </div>
   )
 }

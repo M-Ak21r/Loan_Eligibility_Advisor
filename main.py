@@ -14,6 +14,7 @@ The Dockerfile in this directory containerizes the service.
 """
 
 import os
+import re
 from contextlib import asynccontextmanager
 from typing import Any
 
@@ -59,6 +60,117 @@ class PredictionResponse(BaseModel):
     decision: str
     probability_approved: float
     risk_factors: list[str]
+
+
+class ChatRequest(BaseModel):
+    user_message: str = Field(..., min_length=1, description="User's chat message")
+
+
+class ChatResponse(BaseModel):
+    response: str
+
+
+# ---------------------------------------------------------------------------
+# Chat guardrail & LLM integration
+# ---------------------------------------------------------------------------
+
+CHAT_SYSTEM_PROMPT = (
+    "You are an AI Financial Assistant restricted to the Loan Eligibility Advisor platform. "
+    "You may only discuss loan parameters, DTI, credit scores, and the platform's predictive outputs. "
+    "If the user asks about coding, trivia, politics, or general topics, you must hard-reject the query "
+    "with the exact phrase: 'My parameters restrict me from discussing topics outside of loan eligibility "
+    "and financial profiling.' Maintain a professional, corporate tone."
+)
+
+_FINANCIAL_KEYWORDS = re.compile(
+    r"\b(loan|credit(?: score)?|dti|debt.to.income|income|interest rate|"
+    r"mortgage|borrow|lend|repayment|amortization|apr|fico|eligibilit|"
+    r"approv|reject|risk|collateral|default|principal|financial|bank|"
+    r"fund|invest|asset|liabilit|balance|budget|afford|payment|instalment|"
+    r"installment|rate|term|tenure|refinanc|consolidat)\b",
+    re.IGNORECASE,
+)
+
+_GUARDRAIL_REPLY = (
+    "My parameters restrict me from discussing topics outside of "
+    "loan eligibility and financial profiling."
+)
+
+
+def _mock_llm_response(user_message: str) -> str:
+    """
+    Fallback used when no LLM API key is configured.
+    Demonstrates the guardrail by checking for financial keywords.
+    """
+    if _FINANCIAL_KEYWORDS.search(user_message):
+        # Provide a helpful, on-topic mock response
+        lower = user_message.lower()
+        if "credit score" in lower or "fico" in lower:
+            return (
+                "A credit score (FICO) ranges from 300 to 850. "
+                "Scores above 670 are generally considered good, and scores above 740 "
+                "are considered very good. Higher scores improve your loan approval odds "
+                "and typically result in lower interest rates."
+            )
+        if "dti" in lower or "debt-to-income" in lower or "debt to income" in lower:
+            return (
+                "The Debt-to-Income (DTI) ratio is calculated as your total monthly "
+                "debt payments divided by your gross monthly income. "
+                "Most lenders prefer a DTI below 43%. A lower DTI signals "
+                "stronger repayment capacity and improves eligibility."
+            )
+        if "approv" in lower or "eligib" in lower:
+            return (
+                "Loan approval depends on several factors including your credit score, "
+                "DTI ratio, annual income, employment history, and requested loan amount. "
+                "Use the Loan Eligibility Advisor form above for a personalised assessment."
+            )
+        return (
+            "I can assist you with questions about loan parameters, DTI, credit scores, "
+            "and the platform's eligibility outputs. Please ask a specific financial question."
+        )
+    return _GUARDRAIL_REPLY
+
+
+async def _get_llm_response(user_message: str) -> str:
+    """
+    Attempt to call a real LLM. Tries OpenAI first, then Gemini.
+    Falls back to the mock function if no API key is present.
+    """
+    openai_key = os.getenv("OPENAI_API_KEY")
+    gemini_key = os.getenv("GEMINI_API_KEY")
+
+    if openai_key:
+        try:
+            from openai import AsyncOpenAI  # type: ignore
+            client = AsyncOpenAI(api_key=openai_key)
+            completion = await client.chat.completions.create(
+                model="gpt-4o-mini",
+                messages=[
+                    {"role": "system", "content": CHAT_SYSTEM_PROMPT},
+                    {"role": "user", "content": user_message},
+                ],
+                max_tokens=512,
+                temperature=0.3,
+            )
+            return completion.choices[0].message.content or _GUARDRAIL_REPLY
+        except Exception:
+            pass  # fall through to next provider
+
+    if gemini_key:
+        try:
+            import google.generativeai as genai  # type: ignore
+            genai.configure(api_key=gemini_key)
+            model = genai.GenerativeModel(
+                model_name="gemini-1.5-flash",
+                system_instruction=CHAT_SYSTEM_PROMPT,
+            )
+            result = model.generate_content(user_message)
+            return result.text or _GUARDRAIL_REPLY
+        except Exception:
+            pass  # fall through to mock
+
+    return _mock_llm_response(user_message)
 
 
 # ---------------------------------------------------------------------------
@@ -204,3 +316,19 @@ def predict(application: LoanApplication) -> PredictionResponse:
         probability_approved=round(prob_approved, 4),
         risk_factors=risk_factors,
     )
+
+
+@app.post(
+    "/api/v1/chat",
+    response_model=ChatResponse,
+    tags=["chat"],
+    summary="Financial assistant chatbot",
+)
+async def chat(request: ChatRequest) -> ChatResponse:
+    """
+    Accepts a user message and returns a domain-restricted AI response.
+    A guardrail system prompt ensures the assistant only discusses
+    loan eligibility, DTI, credit scores, and related financial topics.
+    """
+    reply = await _get_llm_response(request.user_message)
+    return ChatResponse(response=reply)
