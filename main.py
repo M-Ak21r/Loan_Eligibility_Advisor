@@ -24,6 +24,12 @@ from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 
+try:
+    import google.generativeai as genai
+    _GENAI_AVAILABLE = True
+except ImportError:
+    _GENAI_AVAILABLE = False
+
 # ---------------------------------------------------------------------------
 # Pydantic schema
 # ---------------------------------------------------------------------------
@@ -61,6 +67,14 @@ class PredictionResponse(BaseModel):
     risk_factors: list[str]
 
 
+class ChatMessage(BaseModel):
+    user_message: str = Field(..., min_length=1, description="User's chat message")
+
+
+class ChatResponse(BaseModel):
+    response: str
+
+
 # ---------------------------------------------------------------------------
 # App state – loaded once at startup
 # ---------------------------------------------------------------------------
@@ -78,10 +92,14 @@ MODEL_DIR = os.path.dirname(os.path.abspath(__file__))
 MODEL_PATH = os.path.join(MODEL_DIR, "rf_model.pkl")
 SCALER_PATH = os.path.join(MODEL_DIR, "scaler.pkl")
 
+# Gemini model instance – initialised once at startup if the key is present
+_gemini_model = None
+
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    """Load ML artefacts into memory once at startup."""
+    """Load ML artefacts and optional LLM client into memory once at startup."""
+    global _gemini_model
     if not os.path.exists(MODEL_PATH):
         raise RuntimeError(
             "Model files not found. Run `python train_model.py` first."
@@ -97,6 +115,16 @@ async def lifespan(app: FastAPI):
         store.scaler = joblib.load(SCALER_PATH) if os.path.exists(SCALER_PATH) else None
         store.feature_columns = []
         store.positive_label = None
+
+    # Initialise Gemini model once if the API key is available
+    api_key = os.environ.get("GEMINI_API_KEY", "")
+    if api_key and _GENAI_AVAILABLE:
+        genai.configure(api_key=api_key)
+        _gemini_model = genai.GenerativeModel(
+            model_name="gemini-1.5-flash",
+            system_instruction=_SYSTEM_PROMPT,
+        )
+
     yield
     # Cleanup (none required)
 
@@ -155,6 +183,48 @@ def _make_decision(prob: float, risk_factors: list[str]) -> str:
 
 
 # ---------------------------------------------------------------------------
+# Chat – system prompt (guardrail)
+# ---------------------------------------------------------------------------
+
+_SYSTEM_PROMPT = (
+    "You are an AI Financial Assistant restricted to the Loan Eligibility Advisor platform. "
+    "You may only discuss loan parameters, DTI, credit scores, and the platform's predictive outputs. "
+    "If the user asks about coding, trivia, politics, or general topics, you must hard-reject the query "
+    "with the exact phrase: 'My parameters restrict me from discussing topics outside of loan eligibility "
+    "and financial profiling.' Maintain a professional, corporate tone."
+)
+
+# Keywords that indicate the message is within the financial domain
+_FINANCIAL_KEYWORDS = {
+    "loan", "credit", "dti", "debt", "income", "score", "interest", "rate",
+    "mortgage", "eligibility", "approval", "risk", "payment", "financial",
+    "finance", "borrow", "lender", "amortize", "principal", "collateral",
+    "fico", "equity", "refinance", "default", "apr",
+}
+
+
+def _mock_chat_response(user_message: str) -> str:
+    """
+    Fallback used when no LLM API key is configured.
+    Demonstrates guardrail logic: off-topic queries are hard-rejected.
+    """
+    lowered = user_message.lower()
+    is_financial = any(kw in lowered for kw in _FINANCIAL_KEYWORDS)
+    if not is_financial:
+        return (
+            "My parameters restrict me from discussing topics outside of "
+            "loan eligibility and financial profiling."
+        )
+    return (
+        "Thank you for your financial query. "
+        "Based on the Loan Eligibility Advisor platform, "
+        "I can help you understand loan parameters such as credit score thresholds, "
+        "debt-to-income (DTI) ratios, and their impact on loan approval decisions. "
+        "Please provide specific details so I can offer a more tailored assessment."
+    )
+
+
+# ---------------------------------------------------------------------------
 # Endpoints
 # ---------------------------------------------------------------------------
 
@@ -204,3 +274,31 @@ def predict(application: LoanApplication) -> PredictionResponse:
         probability_approved=round(prob_approved, 4),
         risk_factors=risk_factors,
     )
+
+
+@app.post(
+    "/api/v1/chat",
+    response_model=ChatResponse,
+    tags=["chat"],
+    summary="Financial domain chatbot",
+)
+async def chat(message: ChatMessage) -> ChatResponse:
+    """
+    Accepts a user message and returns an AI-generated response restricted
+    to the financial / loan-eligibility domain.
+
+    If GEMINI_API_KEY is present in the environment the request is forwarded
+    to Gemini; otherwise a mocked guardrail response is returned.
+    """
+    if _gemini_model is not None:
+        try:
+            result = _gemini_model.generate_content(message.user_message)
+            text = result.text if result.text else (
+                "My parameters restrict me from discussing topics outside of "
+                "loan eligibility and financial profiling."
+            )
+            return ChatResponse(response=text)
+        except Exception as exc:
+            raise HTTPException(status_code=502, detail=f"LLM provider error: {exc}") from exc
+
+    return ChatResponse(response=_mock_chat_response(message.user_message))
