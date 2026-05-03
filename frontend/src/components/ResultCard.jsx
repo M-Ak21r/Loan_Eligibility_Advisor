@@ -2,7 +2,7 @@
  * ResultCard.jsx
  *
  * Displays the API prediction result: decision badge, probability bar,
- * and a list of identified risk factors.
+ * and a list of model-tested ways to improve approval chances.
  */
 
 const DECISION_STYLES = {
@@ -73,14 +73,14 @@ export default function ResultCard({ result }) {
         </div>
       </div>
 
-      {/* Risk factors */}
+      {/* Improvement suggestions */}
       <div>
         <p className="text-sm font-semibold text-slate-700 dark:text-slate-300 mb-2">
-          Risk Factors Identified
+          What Could Improve Approval
         </p>
         {risk_factors.length === 0 ? (
           <p className="text-sm text-slate-500 dark:text-slate-400 italic">
-            No major risk factors detected.
+            No high-impact model-tested changes found.
           </p>
         ) : (
           <ul className="space-y-1.5">
