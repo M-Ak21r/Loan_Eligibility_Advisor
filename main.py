@@ -158,6 +158,7 @@ async def lifespan(app: FastAPI):
         _gemini_model = genai.GenerativeModel(
             model_name="gemini-2.5-flash",
             system_instruction=_SYSTEM_PROMPT,
+            generation_config={"temperature": 0.1},
         )
 
     yield
