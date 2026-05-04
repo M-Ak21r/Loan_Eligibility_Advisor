@@ -27,7 +27,6 @@ from sklearn.preprocessing import StandardScaler
 RANDOM_SEED = 42
 MODEL_DIR = Path(__file__).resolve().parent
 DATA_CANDIDATES = (
-    MODEL_DIR / "credit_data.csv",
     MODEL_DIR / "credit_risk_dataset.csv",
 )
 MODEL_PATH = MODEL_DIR / "rf_model.pkl"

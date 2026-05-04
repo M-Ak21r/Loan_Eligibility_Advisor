@@ -1,55 +1,81 @@
 """
 main.py
 -------
-Phase 2: FastAPI Backend
+FastAPI backend for the Loan Eligibility Advisor.
 
-Loads the serialized RandomForest model and StandardScaler on startup,
-exposes a /api/v1/predict POST endpoint, and returns a deterministic
-loan-eligibility decision.
-
-Run locally:
-    uvicorn main:app --reload --port 8000
-
-The Dockerfile in this directory containerizes the service.
+Loads the serialized RandomForest artifacts on startup, exposes a
+/api/v1/predict endpoint for deterministic loan-eligibility predictions, and
+provides an optional domain-restricted chat endpoint.
 """
 
 import os
 from contextlib import asynccontextmanager
-from typing import Any
+from typing import Any, Optional
 
 import joblib
-import pandas as pd
 import numpy as np
+import pandas as pd
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
+
+try:
+    from dotenv import load_dotenv
+except ImportError:
+    load_dotenv = None
+
+try:
+    import google.generativeai as genai
+
+    _GENAI_AVAILABLE = True
+except ImportError:
+    _GENAI_AVAILABLE = False
+
+if load_dotenv is not None:
+    load_dotenv()
+
 
 # ---------------------------------------------------------------------------
 # Pydantic schema
 # ---------------------------------------------------------------------------
 
 class LoanApplication(BaseModel):
-    annual_income: float = Field(..., gt=0, description="Gross annual income in USD")
-    credit_score: float = Field(..., ge=300, le=850, description="FICO credit score")
-    debt_to_income_ratio: float = Field(
-        ..., ge=0.0, le=1.0, description="Total monthly debt / gross monthly income"
+    person_age: int = Field(..., ge=18, description="Applicant age")
+    person_income: float = Field(..., gt=0, description="Annual income in USD")
+    person_home_ownership: str = Field(..., description="OWN / MORTGAGE / RENT / OTHER")
+    person_emp_length: float = Field(..., ge=0, description="Years in current employment")
+    loan_intent: str = Field(..., description="Loan purpose")
+    loan_grade: str = Field(..., description="Loan grade (A..G)")
+    loan_amnt: float = Field(..., gt=0, description="Requested loan amount")
+    loan_int_rate: float = Field(..., ge=0, description="Interest rate as a percentage")
+    loan_percent_income: float = Field(
+        ...,
+        ge=0,
+        le=1,
+        description="Loan amount / income as a fraction",
     )
-    employment_length_years: float = Field(
-        ..., ge=0, description="Years in current employment"
-    )
-    loan_amount_requested: float = Field(
-        ..., gt=0, description="Requested loan amount in USD"
+    cb_person_default_on_file: str = Field(..., description="Y or N")
+    cb_person_cred_hist_length: float = Field(
+        ...,
+        ge=0,
+        description="Credit history length in years",
     )
 
     model_config = {
         "extra": "allow",
         "json_schema_extra": {
             "example": {
-                "annual_income": 75000,
-                "credit_score": 720,
-                "debt_to_income_ratio": 0.25,
-                "employment_length_years": 5,
-                "loan_amount_requested": 15000,
+                "person_age": 35,
+                "person_income": 59000,
+                "person_home_ownership": "RENT",
+                "person_emp_length": 3.0,
+                "loan_intent": "PERSONAL",
+                "loan_grade": "C",
+                "loan_amnt": 35000,
+                "loan_int_rate": 15.23,
+                "loan_percent_income": 0.59,
+                "cb_person_default_on_file": "N",
+                "cb_person_cred_hist_length": 3,
             }
         },
     }
@@ -61,8 +87,24 @@ class PredictionResponse(BaseModel):
     risk_factors: list[str]
 
 
+class ChatMessage(BaseModel):
+    user_message: str = Field(..., min_length=1, description="User's chat message")
+    application: Optional[dict[str, Any]] = Field(
+        None,
+        description="Optional loan application context",
+    )
+    prediction: Optional[PredictionResponse] = Field(
+        None,
+        description="Optional model prediction context",
+    )
+
+
+class ChatResponse(BaseModel):
+    response: str
+
+
 # ---------------------------------------------------------------------------
-# App state – loaded once at startup
+# App state loaded once at startup
 # ---------------------------------------------------------------------------
 
 class _ModelStore:
@@ -72,20 +114,24 @@ class _ModelStore:
     approval_label: Any = None
     approval_profile: dict[str, dict[str, Any]] = {}
 
+
 store = _ModelStore()
 
 MODEL_DIR = os.path.dirname(os.path.abspath(__file__))
 MODEL_PATH = os.path.join(MODEL_DIR, "rf_model.pkl")
 SCALER_PATH = os.path.join(MODEL_DIR, "scaler.pkl")
 
+_gemini_model = None
+
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    """Load ML artefacts into memory once at startup."""
+    """Load ML artifacts and optional LLM client into memory once."""
+    global _gemini_model
+
     if not os.path.exists(MODEL_PATH):
-        raise RuntimeError(
-            "Model files not found. Run `python train_model.py` first."
-        )
+        raise RuntimeError("Model files not found. Run `python train_model.py` first.")
+
     artifacts = joblib.load(MODEL_PATH)
     if isinstance(artifacts, dict) and "model" in artifacts:
         store.model = artifacts["model"]
@@ -100,15 +146,12 @@ async def lifespan(app: FastAPI):
         store.model = artifacts
         store.scaler = joblib.load(SCALER_PATH) if os.path.exists(SCALER_PATH) else None
         store.feature_columns = []
-<<<<<<< Updated upstream
-        store.positive_label = None
-=======
         store.approval_label = None
         store.approval_profile = {}
 
     if hasattr(store.model, "n_jobs"):
         store.model.n_jobs = 1
-    # Initialise Gemini model once if the API key is available
+
     api_key = os.environ.get("GEMINI_API_KEY", "")
     if api_key and _GENAI_AVAILABLE:
         genai.configure(api_key=api_key)
@@ -117,9 +160,7 @@ async def lifespan(app: FastAPI):
             system_instruction=_SYSTEM_PROMPT,
         )
 
->>>>>>> Stashed changes
     yield
-    # Cleanup (none required)
 
 
 # ---------------------------------------------------------------------------
@@ -140,24 +181,13 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+
 # ---------------------------------------------------------------------------
-# Helpers: model-driven probability and improvement suggestions
+# Model-driven probability and improvement suggestions
 # ---------------------------------------------------------------------------
 
-<<<<<<< Updated upstream
-RISK_THRESHOLDS = {
-    "Low credit score (< 620)": lambda a: a.credit_score < 620,
-    "High debt-to-income ratio (> 40%)": lambda a: a.debt_to_income_ratio > 0.40,
-    "Short employment history (< 2 years)": lambda a: a.employment_length_years < 2,
-    "High loan-to-income ratio (> 40%)": lambda a: (
-        a.loan_amount_requested / a.annual_income
-    ) > 0.40,
-    "Low annual income (< $30,000)": lambda a: a.annual_income < 30_000,
-}
-=======
 GRADE_ORDER = ("A", "B", "C", "D", "E", "F", "G")
 MIN_SUGGESTION_LIFT = 0.01
->>>>>>> Stashed changes
 
 
 def _score_application(application: LoanApplication) -> float:
@@ -186,11 +216,12 @@ def _format_currency(value: float) -> str:
 
 
 def _make_application(payload: dict[str, Any]) -> LoanApplication:
-    payload["loan_percent_income"] = max(
+    next_payload = payload.copy()
+    next_payload["loan_percent_income"] = max(
         0,
-        min(float(payload["loan_percent_income"]), 1),
+        min(float(next_payload["loan_percent_income"]), 1),
     )
-    return LoanApplication(**payload)
+    return LoanApplication(**next_payload)
 
 
 def _numeric_profile_value(column: str) -> Optional[float]:
@@ -290,9 +321,14 @@ def _candidate_improvements(application: LoanApplication) -> list[tuple[str, Loa
             _make_application(payload),
         ))
 
-        combined_payload = base.copy()
+    combined_payload = base.copy()
+    if approved_income and application.person_income < approved_income:
+        combined_payload["person_income"] = approved_income
     if approved_loan_percent and application.loan_percent_income > approved_loan_percent:
-        combined_payload["loan_amnt"] = max(1.0, application.person_income * approved_loan_percent)
+        combined_payload["loan_amnt"] = max(
+            1.0,
+            combined_payload["person_income"] * approved_loan_percent,
+        )
         combined_payload["loan_percent_income"] = approved_loan_percent
     if approved_interest and application.loan_int_rate > approved_interest:
         combined_payload["loan_int_rate"] = approved_interest
@@ -302,10 +338,9 @@ def _candidate_improvements(application: LoanApplication) -> list[tuple[str, Loa
         combined_payload["person_emp_length"] = approved_emp_length
     if approved_default_status:
         combined_payload["cb_person_default_on_file"] = approved_default_status
-    if approved_income and application.person_income < approved_income:
-        combined_payload["person_income"] = approved_income
+    if combined_payload["person_income"] > 0:
         combined_payload["loan_percent_income"] = (
-            combined_payload["loan_amnt"] / approved_income
+            combined_payload["loan_amnt"] / combined_payload["person_income"]
         )
 
     if combined_payload != base:
@@ -338,6 +373,7 @@ def _derive_improvement_suggestions(
         for lift, label, probability in suggestions[:4]
     ]
 
+
 # ---------------------------------------------------------------------------
 # Decision logic
 # ---------------------------------------------------------------------------
@@ -352,6 +388,109 @@ def _make_decision(prob: float) -> str:
     if prob >= CONDITIONAL_THRESHOLD:
         return "Conditional"
     return "Rejected"
+
+
+def _format_application_summary(application: LoanApplication) -> str:
+    return (
+        f"Applicant age: {application.person_age}; "
+        f"Income: {_format_currency(application.person_income)}; "
+        f"Home ownership: {application.person_home_ownership}; "
+        f"Employment years: {application.person_emp_length}; "
+        f"Loan amount: {_format_currency(application.loan_amnt)}; "
+        f"Interest: {application.loan_int_rate:.2f}%; "
+        f"Loan intent: {application.loan_intent}; "
+        f"Grade: {application.loan_grade}"
+    )
+
+
+# ---------------------------------------------------------------------------
+# Chat guardrail
+# ---------------------------------------------------------------------------
+
+_SYSTEM_PROMPT = (
+    "You are an AI Financial Assistant restricted to the Loan Eligibility Advisor platform. "
+    "You may only discuss loan parameters, DTI, credit scores, and the platform's predictive outputs. "
+    "When an application and model prediction are provided, treat them as the authoritative context "
+    "for the answer. Reference the applicant's specific values, decision, approval probability, and "
+    "model-tested improvement suggestions instead of giving generic advice. "
+    "If the user asks about coding, trivia, politics, or general topics, you must hard-reject the query "
+    "with the exact phrase: 'My parameters restrict me from discussing topics outside of loan eligibility "
+    "and financial profiling.' Maintain a professional, corporate tone."
+)
+
+_FINANCIAL_KEYWORDS = {
+    "loan",
+    "credit",
+    "dti",
+    "debt",
+    "income",
+    "score",
+    "interest",
+    "rate",
+    "mortgage",
+    "eligibility",
+    "approval",
+    "risk",
+    "payment",
+    "financial",
+    "finance",
+    "borrow",
+    "lender",
+    "amortize",
+    "principal",
+    "collateral",
+    "fico",
+    "equity",
+    "refinance",
+    "default",
+    "apr",
+}
+
+_GUARDRAIL_REPLY = (
+    "My parameters restrict me from discussing topics outside of "
+    "loan eligibility and financial profiling."
+)
+
+
+def _mock_chat_response(user_message: str) -> str:
+    lowered = user_message.lower()
+    is_financial = any(keyword in lowered for keyword in _FINANCIAL_KEYWORDS)
+    if not is_financial:
+        return _GUARDRAIL_REPLY
+    return (
+        "I can help with loan eligibility factors such as income, loan burden, "
+        "interest rate, default history, employment length, and the model's "
+        "approval output. Share an application result if you want a focused review."
+    )
+
+
+def _build_chat_context(
+    application: Optional[dict[str, Any]],
+    prediction: Optional[PredictionResponse],
+) -> tuple[list[str], Optional[LoanApplication]]:
+    prompt_lines = []
+    app_obj = None
+
+    if application:
+        try:
+            app_obj = LoanApplication(**application)
+            prompt_lines.append(
+                "Application context supplied by the user: "
+                f"{_format_application_summary(app_obj)}"
+            )
+        except Exception:
+            prompt_lines.append(f"Application context supplied by the user: {application}")
+
+    if prediction:
+        prompt_lines.append(
+            "Model prediction context: "
+            f"Decision: {prediction.decision}; "
+            f"Approved probability: {prediction.probability_approved}; "
+            "Model-tested improvement suggestions: "
+            f"{', '.join(prediction.risk_factors) if prediction.risk_factors else 'None'}"
+        )
+
+    return prompt_lines, app_obj
 
 
 # ---------------------------------------------------------------------------
@@ -370,11 +509,6 @@ def health_check():
     summary="Predict loan eligibility",
 )
 def predict(application: LoanApplication) -> PredictionResponse:
-    """
-    Accepts a loan application payload, scales the features using the fitted
-    StandardScaler, runs inference with the RandomForest model, and returns
-    an eligibility decision along with identified risk factors.
-    """
     if store.model is None or store.scaler is None:
         raise HTTPException(status_code=503, detail="Model not loaded.")
 
@@ -382,14 +516,11 @@ def predict(application: LoanApplication) -> PredictionResponse:
     risk_factors = _derive_improvement_suggestions(application, prob_approved)
     decision = _make_decision(prob_approved)
 
-
     return PredictionResponse(
         decision=decision,
         probability_approved=round(prob_approved, 4),
         risk_factors=risk_factors,
     )
-<<<<<<< Updated upstream
-=======
 
 
 @app.post(
@@ -399,49 +530,21 @@ def predict(application: LoanApplication) -> PredictionResponse:
     summary="Financial domain chatbot",
 )
 async def chat(message: ChatMessage) -> ChatResponse:
-    """
-    Accepts a user message and returns an AI-generated response restricted
-    to the financial / loan-eligibility domain.
-
-    If GEMINI_API_KEY is present in the environment the request is forwarded
-    to Gemini; otherwise a mocked guardrail response is returned.
-    """
-    # Build a prompt that includes the application and prediction context when provided.
-    prompt_lines = []
-    app_obj = None
-    if message.application:
-        try:
-            # Try to coerce into LoanApplication for consistent risk-factor derivation
-            app_obj = LoanApplication(**message.application)
-            prompt_lines.append(f"Application: {_format_application_summary(app_obj)}")
-        except Exception:
-            # If parsing fails, fall back to raw dict embedding
-            prompt_lines.append(f"Application: {message.application}")
-
-    if message.prediction:
+    prompt_lines, app_obj = _build_chat_context(message.application, message.prediction)
+    if prompt_lines:
         prompt_lines.append(
-            "Model decision: "
-            f"{message.prediction.decision}; "
-            f"Approved probability: {message.prediction.probability_approved}; "
-            "Model-tested improvement suggestions: "
-            f"{', '.join(message.prediction.risk_factors) if message.prediction.risk_factors else 'None'}"
+            "Answer the user's question using the application and prediction context above."
         )
-
     prompt_lines.append(f"User: {message.user_message}")
     prompt_text = "\n".join(prompt_lines)
 
     if _gemini_model is not None:
         try:
             result = _gemini_model.generate_content(prompt_text)
-            text = result.text if result.text else (
-                "My parameters restrict me from discussing topics outside of "
-                "loan eligibility and financial profiling."
-            )
-            return ChatResponse(response=text)
+            return ChatResponse(response=result.text or _GUARDRAIL_REPLY)
         except Exception as exc:
             raise HTTPException(status_code=502, detail=f"LLM provider error: {exc}") from exc
 
-    # Fallback mock: if an application was provided, include model-tested improvements
     if app_obj is not None:
         if message.prediction:
             improvements = message.prediction.risk_factors
@@ -458,18 +561,18 @@ async def chat(message: ChatMessage) -> ChatResponse:
         prediction_text = (
             f"Decision: {message.prediction.decision}; "
             f"Probability: {message.prediction.probability_approved}; "
-            f"Suggested improvements: {', '.join(message.prediction.risk_factors) if message.prediction else 'None'}"
+            f"Suggested improvements: {', '.join(message.prediction.risk_factors)}"
             if message.prediction
             else "No model prediction supplied."
         )
-        mock = (
-            f"I reviewed the provided application. Summary: {_format_application_summary(app_obj)}. "
-            f"Model context: {prediction_text} "
-            f"Current estimated approval probability: {probability * 100:.1f}%. "
-            f"The most useful model-tested next steps are: {improvement_text}. "
-            "These are counterfactual estimates from the trained model, so treat them as guidance rather than a lender guarantee."
+        return ChatResponse(
+            response=(
+                f"I reviewed the provided application. Summary: {_format_application_summary(app_obj)}. "
+                f"Model context: {prediction_text}. "
+                f"Current estimated approval probability: {probability * 100:.1f}%. "
+                f"The most useful model-tested next steps are: {improvement_text}. "
+                "These are counterfactual estimates from the trained model, so treat them as guidance."
+            )
         )
-        return ChatResponse(response=mock)
 
     return ChatResponse(response=_mock_chat_response(message.user_message))
->>>>>>> Stashed changes

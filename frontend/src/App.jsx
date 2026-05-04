@@ -14,6 +14,7 @@
 import { useState, useEffect } from 'react'
 import LoanForm from './components/LoanForm'
 import ResultCard from './components/ResultCard'
+import ChatWidget from './components/ChatWidget'
 
 const API_BASE = import.meta.env.VITE_API_URL ?? ''
 
@@ -22,6 +23,7 @@ export default function App() {
   const [loading, setLoading] = useState(false)
   const [error, setError] = useState(null)
   const [backendReady, setBackendReady] = useState(null) // null = checking
+  const [lastApplication, setLastApplication] = useState(null)
 
   // ── Lifecycle: verify backend on mount ────────────────────────────────────
   useEffect(() => {
@@ -37,6 +39,7 @@ export default function App() {
     setLoading(true)
     setError(null)
     setResult(null)
+    setLastApplication(payload)
 
     try {
       const response = await fetch(`${API_BASE}/api/v1/predict`, {
@@ -127,6 +130,8 @@ export default function App() {
       <footer className="mt-16 text-xs text-slate-400 dark:text-slate-600 text-center">
         Loan Eligibility Advisor MVP · Powered by RandomForest &amp; FastAPI
       </footer>
+
+      <ChatWidget application={lastApplication} prediction={result} />
     </div>
   )
 }
