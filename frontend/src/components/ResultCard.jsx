@@ -73,29 +73,7 @@ export default function ResultCard({ result }) {
         </div>
       </div>
 
-      {/* Improvement suggestions */}
-      <div>
-        <p className="text-sm font-semibold text-slate-700 dark:text-slate-300 mb-2">
-          What Could Improve Approval
-        </p>
-        {risk_factors.length === 0 ? (
-          <p className="text-sm text-slate-500 dark:text-slate-400 italic">
-            No high-impact model-tested changes found.
-          </p>
-        ) : (
-          <ul className="space-y-1.5">
-            {risk_factors.map((factor) => (
-              <li
-                key={factor}
-                className="flex items-start gap-2 text-sm text-slate-700 dark:text-slate-200"
-              >
-                <span className="mt-0.5 text-red-500 font-bold shrink-0">•</span>
-                {factor}
-              </li>
-            ))}
-          </ul>
-        )}
-      </div>
+      
     </div>
   )
 }
